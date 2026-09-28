@@ -92,6 +92,88 @@ Text #${nfdTag} here`;
         assert.ok(!result.tags.includes("la"));
     });
 
+    it("ignores #tags inside inline code spans", () => {
+        const content = "Set the `#Kategori` field and ``#Household`` too, but keep #real here";
+        const result = parseFrontmatterAndLinks(content);
+        assert.deepEqual(result.tags, ["real"]);
+    });
+
+    it("ignores #tags inside fenced code blocks", () => {
+        const content = "#before\n```\n#Household\n#inside/nested\n```\n#after\n~~~md\n#tilde\n~~~\n";
+        const result = parseFrontmatterAndLinks(content);
+        assert.deepEqual(result.tags, ["before", "after"]);
+    });
+
+    it("treats an unclosed fence as running to the end", () => {
+        const content = "#kept\n```\n#lost\n#also-lost";
+        const result = parseFrontmatterAndLinks(content);
+        assert.deepEqual(result.tags, ["kept"]);
+    });
+
+    it("leaves an unmatched backtick run as literal text", () => {
+        const content = "A stray ` here and #tag stays; a ``span with #hidden`` hides it";
+        const result = parseFrontmatterAndLinks(content);
+        assert.deepEqual(result.tags, ["tag"]);
+    });
+
+    it("does not let a stray backtick pair across a blank line", () => {
+        const sections = Array.from({ length: 20 }, (_, i) => `## Section ${i}\nSome notes here. #tag${i}`);
+        const content = [
+            "The user`s request needs follow up. #important",
+            ...sections,
+            "Circling back, thats it`s done. #wrapup",
+        ].join("\n\n");
+        const result = parseFrontmatterAndLinks(content);
+        assert.equal(result.tags.length, 22);
+        assert.ok(result.tags.includes("important"));
+        assert.ok(result.tags.includes("tag0") && result.tags.includes("tag19"));
+        assert.ok(result.tags.includes("wrapup"));
+    });
+
+    it("masks many unmatched backtick runs in linear time", () => {
+        const parts: string[] = [];
+        for (let n = 1, len = 0; len < 2_000_000; n++) {
+            parts.push("`".repeat(n) + " x ");
+            len += n + 3;
+        }
+        const content = parts.join("") + "#end";
+        const start = performance.now();
+        const result = parseFrontmatterAndLinks(content);
+        assert.ok(performance.now() - start < 2000);
+        assert.deepEqual(result.tags, ["end"]);
+    });
+
+    it("does not let masking create or extend a tag", () => {
+        const content = "`x`#glued and #tag`y` and `#a`#b";
+        const result = parseFrontmatterAndLinks(content);
+        assert.deepEqual(result.tags, ["tag"]);
+    });
+
+    it("rejects all-numeric tags but keeps tags with a non-numerical character", () => {
+        const content = "See PR #1984 and issue #20; #y1984 and #2026/09 and #x-1 are tags";
+        const result = parseFrontmatterAndLinks(content);
+        assert.ok(!result.tags.includes("1984"));
+        assert.ok(!result.tags.includes("20"));
+        assert.ok(result.tags.includes("y1984"));
+        // Literal reading of "at least one non-numerical character"; whether
+        // Obsidian counts "/" for that is checked against the app (uppdrag 71).
+        assert.ok(result.tags.includes("2026/09"));
+        assert.ok(result.tags.includes("x-1"));
+    });
+
+    it("keeps tags made of non-decimal number characters", () => {
+        const content = "Chapter #Ⅳ and footnote #² are tags, #42 is not";
+        const result = parseFrontmatterAndLinks(content);
+        assert.deepEqual(result.tags, ["Ⅳ", "²"]);
+    });
+
+    it("keeps frontmatter tags even when all-numeric", () => {
+        const content = "---\ntags: [2024, project]\n---\nText";
+        const result = parseFrontmatterAndLinks(content);
+        assert.ok(result.tags.includes("2024"));
+        assert.ok(result.tags.includes("project"));
+    });
+
     it("deduplicates tags from frontmatter and inline", () => {
         const content = `---
 tags: [shared]
