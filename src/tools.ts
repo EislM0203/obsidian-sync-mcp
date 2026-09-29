@@ -5,6 +5,7 @@ import type { VaultBackend } from "./vault-backend.js";
 import type { SearchIndex } from "./search.js";
 import { isPathWritable } from "./write-scope.js";
 import { describeListing, describeNoMatch } from "./list-format.js";
+import { extractSnippet } from "./parse.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -371,6 +372,55 @@ export function registerTools(
             }
             lines.push(`\n[Open in Obsidian](${deepLink})`);
             return lines.join("\n");
+        },
+    });
+
+    server.addTool({
+        name: "search_vault",
+        description:
+            "Search note content across the Obsidian vault using full-text search. Returns ranked results with snippets showing where terms matched. Supports folder and tag filtering.",
+        parameters: z.object({
+            query: z.string().describe("Search query, e.g. 'machine learning'"),
+            folder: z.string().optional().describe("Folder to limit search to, e.g. 'daily' or 'projects'"),
+            limit: z.coerce.number().optional().describe("Max number of results to return. Default 10."),
+            tag: z.string().optional().describe("Filter results by tag, e.g. 'project'"),
+        }),
+        execute: async ({ query, folder, limit, tag }) => {
+            // Handle index state
+            if (searchIndex.state === "building") {
+                return `Search index is still building (${searchIndex.size} notes indexed so far). Results may be incomplete.`;
+            }
+            if (searchIndex.state === "failed") {
+                return "Search index failed to build. Search is unavailable.";
+            }
+
+            const results = searchIndex.search(query, folder, limit ?? 10);
+            if (results.length === 0) {
+                return `No results found for "${query}".`;
+            }
+
+            // Read content for top results to generate snippets
+            const lines: string[] = [];
+            let shown = 0;
+            for (const { path, score } of results) {
+                // Apply tag filter if specified
+                if (tag && !searchIndex.getTags(path).includes(tag)) continue;
+
+                const content = await vault.readNote(path);
+                if (content === null) continue;
+
+                const snippet = extractSnippet(content, query);
+                const deepLink = makeDeepLink(vaultName, path);
+                lines.push(
+                    `- **${path}** (score: ${score.toFixed(1)})\n  \`${snippet}\`\n  [Open in Obsidian](${deepLink})`,
+                );
+                shown++;
+            }
+
+            if (shown === 0) {
+                return `No results found for "${query}".`;
+            }
+            return lines.join("\n\n");
         },
     });
 }
