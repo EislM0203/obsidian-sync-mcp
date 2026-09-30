@@ -215,7 +215,7 @@ Every tool response includes an [Obsidian deep link](https://help.obsidian.md/Ex
 
 ### Search
 
-`search_vault` matches whole words, case-insensitively, and every word must appear in a note (AND). Common words like "the" and "and" are ignored, and so is text inside code blocks. Filenames are searched alongside content, and a filename hit ranks higher. Results are ranked so that rare words and repeated words count for more.
+`search_vault` is case-insensitive and every word must appear in a note (AND). Words match by prefix, with simple plural and tense handling: `deploy` finds `deployment`, and `meetings` finds `meeting`. Exact matches weigh more than expanded ones, and words shorter than three characters match exactly. Common words like "the" and "and" are ignored, and so is text inside code blocks. Filenames are searched alongside content, and a filename hit ranks higher. Results are ranked so that rare words and repeated words count for more.
 
 ```
 search_vault(query="quarterly budget")

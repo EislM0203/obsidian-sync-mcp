@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
-import { SearchIndex, queryTerms, MAX_QUERY_TERMS } from "./search.js";
+import { SearchIndex, queryTerms, stemOf, MAX_QUERY_TERMS } from "./search.js";
 
 let tmpDir: string;
 
@@ -287,5 +287,62 @@ describe("SearchIndex full-text", () => {
         assert.equal(await idx.loadFromDisk(), false);
         assert.equal(idx.size, 0);
         assert.equal(idx.since, "", "since must reset so CouchDB replays from the start");
+    });
+});
+
+describe("SearchIndex prefix and inflection matching", () => {
+    const search = (idx: SearchIndex, q: string) => idx.search(queryTerms(q)).map((h) => h.path);
+
+    it("finds longer forms of a word by prefix", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "weekly meetings with the team", 1);
+        idx.update("b.md", "the deployment went fine", 2);
+        assert.deepEqual(search(idx, "meet"), ["a.md"]);
+        assert.deepEqual(search(idx, "deploy"), ["b.md"]);
+    });
+
+    it("finds the base form from a plural or past-tense query", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "one meeting today", 1);
+        idx.update("b.md", "still deploying", 2);
+        idx.update("c.md", "a box of watches", 3);
+        assert.deepEqual(search(idx, "meetings"), ["a.md"]);
+        assert.deepEqual(search(idx, "deployed"), ["b.md"]);
+        assert.deepEqual(search(idx, "watch"), ["c.md"]);
+    });
+
+    it("weighs an exact match above a prefix match, other things equal", () => {
+        // Not an absolute tier: a note that repeats "meetings" often can still
+        // outrank one mentioning "meeting" once, which is the better answer.
+        const idx = new SearchIndex();
+        idx.update("prefix.md", "meetings", 1);
+        idx.update("exact.md", "meeting", 2);
+        assert.deepEqual(search(idx, "meeting"), ["exact.md", "prefix.md"]);
+    });
+
+    it("keeps AND across words while expanding each one", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "deployment meetings", 1);
+        idx.update("b.md", "deployment only", 2);
+        assert.deepEqual(search(idx, "deploy meet"), ["a.md"]);
+    });
+
+    it("matches short words exactly instead of expanding them", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "about aboard", 1);
+        idx.update("b.md", "ab testing", 2);
+        assert.deepEqual(search(idx, "ab"), ["b.md"]);
+    });
+
+    it("does not stem words into unrelated shorter ones", () => {
+        assert.equal(stemOf("meetings"), "meeting");
+        assert.equal(stemOf("deployed"), "deploy");
+        assert.equal(stemOf("watches"), "watch");
+        assert.equal(stemOf("notes"), "note", "not 'not', which would match 'nothing'");
+        assert.equal(stemOf("used"), "used", "not 'us'");
+        assert.equal(stemOf("class"), "class", "a double s is not a plural");
+        const idx = new SearchIndex();
+        idx.update("a.md", "nothing to see", 1);
+        assert.deepEqual(search(idx, "notes"), []);
     });
 });

@@ -6,7 +6,7 @@ import type { SearchIndex } from "./search.js";
 import { isPathWritable } from "./write-scope.js";
 import { describeListing, describeNoMatch } from "./list-format.js";
 import { extractSnippet } from "./parse.js";
-import { queryTerms } from "./search.js";
+import { queryTerms, stemOf } from "./search.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -385,7 +385,7 @@ export function registerTools(
     server.addTool({
         name: "search_vault",
         description:
-            "Full-text search across note content and filenames. Every word must appear in a note for it to match (AND); common words like 'the' or 'and' are ignored. Matching is by whole word, case-insensitive. Returns the best matches first, each with a snippet. Narrow with folder, tag, or modified_after. Use list_notes instead to find a note by its name.",
+            "Full-text search across note content and filenames. Every word must appear in a note for it to match (AND); common words like 'the' or 'and' are ignored. Matching is case-insensitive and by word prefix, with simple plural and tense handling: 'deploy' finds 'deployment', and 'meetings' finds 'meeting'. Exact matches weigh more than expanded ones. Returns the best matches first, each with a snippet. Narrow with folder, tag, or modified_after. Use list_notes instead to find a note by its name.",
         parameters: z.object({
             query: z
                 .string()
@@ -460,7 +460,9 @@ export function registerTools(
                     const date = mtime ? ` · ${new Date(mtime).toISOString().slice(0, 10)}` : "";
                     const head = `- [${path}](${makeDeepLink(vaultName, path)})${date}`;
                     if (!content) return head;
-                    const snippet = extractSnippet(content, terms.join(" ")).replace(/\s+/g, " ").trim();
+                    // Stems, not the typed words: a note matched via "meeting" for the
+                    // query "meetings" does not contain "meetings" to anchor on.
+                    const snippet = extractSnippet(content, terms.map(stemOf).join(" ")).replace(/\s+/g, " ").trim();
                     return snippet ? `${head}\n  ${snippet}` : head;
                 }),
             );

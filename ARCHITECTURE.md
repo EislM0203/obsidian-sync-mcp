@@ -51,9 +51,16 @@ code point at a time rather than with `toLowerCase`, which is context-sensitive
 (Greek final sigma) and would stop a query from meeting the indexed form of
 the same word. The filename is indexed alongside the body.
 
-`search(terms)` is strict AND, intersecting postings from the rarest term up.
-Score per term is `(1 + log tf) * log(1 + N / df)`, with a filename hit adding
-the term's IDF again. It returns every match; the tool filters by folder, tag
+`search(terms)` is strict AND across query words. Each word of three or more
+characters expands to every indexed word starting with its stem — `stemOf`
+strips one of `-ing`, `-ed`, `-es` (after s/x/z/ch/sh) or `-s`, keeping at
+least four characters — so `deploy` finds `deployment` and `meetings` finds
+`meeting`. The vocabulary is scanned linearly for this: a few thousand to a
+few tens of thousands of words on a personal vault, measured at 6 ms (1k notes)
+to 27 ms (10k) for a worst-case query of short, common prefixes. Score per
+matched word is `(1 + log tf) * log(1 + N / df)`, plus the IDF again for a
+filename hit, times 0.6 for an expansion rather than an exact match; a note
+keeps its best expansion per query word. It returns every match; the tool filters by folder, tag
 and date *before* applying the limit, then reads only the shown notes for
 snippets — so a query costs at most `limit` reads.
 

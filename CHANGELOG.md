@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Features
-- **`search_vault` is back** — full-text search across note content and filenames, removed in 0.5.0. Every word must match (AND), case-insensitively; common words and code blocks are ignored; results are ranked by how rare and how frequent the matched words are, with filename hits first, and each comes with a snippet. Filter with `folder`, `tag`, or `modified_after`. A search reads only the notes it returns.
+- **`search_vault` is back** — full-text search across note content and filenames, removed in 0.5.0. Every word must match (AND), case-insensitively and by prefix with simple plural/tense handling (`deploy` finds `deployment`, `meetings` finds `meeting`); common words and code blocks are ignored; results are ranked by how rare and how frequent the matched words are, with filename hits first, and each comes with a snippet. Filter with `folder`, `tag`, or `modified_after`. A search reads only the notes it returns.
 - The index is persisted with the rest of the search metadata, so a restart does not re-read the vault. An index from 0.7.0 or earlier is rebuilt automatically on first start.
 
 ### Notes

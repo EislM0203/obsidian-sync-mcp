@@ -398,6 +398,11 @@ describe("E2E: search_vault", () => {
         assert.ok(out.includes("searchbox/beta.md") && !out.includes("searchbox/alpha.md"), out);
     });
 
+    it("matches word prefixes and simple inflections", async () => {
+        assert.ok((await callTool("search_vault", { query: "zebra" })).includes("searchbox/alpha.md"));
+        assert.ok((await callTool("search_vault", { query: "habitat" })).includes("searchbox/beta.md"));
+    });
+
     it("finds a note by filename", async () => {
         assert.ok((await callTool("search_vault", { query: "quokka" })).includes("searchbox/quokka.md"));
     });

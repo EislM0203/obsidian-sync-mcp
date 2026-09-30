@@ -76,6 +76,37 @@ export function queryTerms(query: string): string[] {
     return [...tokenize(query).keys()].slice(0, MAX_QUERY_TERMS);
 }
 
+/** Shortest query word that expands to the indexed words it prefixes. Shorter words match exactly. */
+export const MIN_PREFIX_LEN = 3;
+
+/** How much a prefix or stemmed match counts relative to an exact one. */
+const PREFIX_WEIGHT = 0.6;
+
+/**
+ * The stem a query word expands from: a trailing inflection is stripped so
+ * `meetings` also finds `meeting` and `deployed` finds `deploying`, then every
+ * indexed word starting with the stem matches.
+ *
+ * Deliberately crude — four suffixes, no dictionary — because a query that
+ * over-matches a little is recoverable (the model reads the snippets) and an
+ * opaque stemmer is not. Two guards keep it from over-reaching: the stem must
+ * stay at least four characters (`used` does not become `us`), and `es` is
+ * only removed where English adds it (`boxes`, `watches`), so `notes` does not
+ * collapse to `not` and match `nothing`.
+ */
+export function stemOf(term: string): string {
+    const rules: [RegExp, number][] = [
+        [/ing$/, 3],
+        [/ed$/, 2],
+        [/(?:s|x|z|ch|sh)es$/, 2],
+        [/[^s]s$/, 1],
+    ];
+    for (const [re, cut] of rules) {
+        if (re.test(term) && term.length - cut >= 4) return term.slice(0, -cut);
+    }
+    return term;
+}
+
 /** Filename without folders or extension — indexed alongside the body. */
 function basenameText(path: string): string {
     const name = path.slice(path.lastIndexOf("/") + 1);
@@ -279,12 +310,11 @@ export class SearchIndex {
     /**
      * Every note containing ALL query terms, best first.
      *
-     * Strict AND: a note missing any term is not a match, so a multi-word query
-     * narrows instead of quietly widening to "any of these words".
-     *
-     * Score per term is (1 + log tf) * log(1 + N / df): rare terms weigh more,
-     * repetition helps with diminishing returns. A term that also appears in
-     * the filename counts double. Ties go to the path, so results are stable.
+     * Strict AND: a note missing any query word is not a match, so a
+     * multi-word query narrows instead of quietly widening to "any of these
+     * words". Each word matches by prefix of its stem (see `scoreTerm` and
+     * `stemOf`), so `meet` finds `meetings` and `meetings` finds `meeting`.
+     * Ties go to the path, so results are stable.
      *
      * Returns all matches, unsliced: callers filter by folder/tag/date first
      * and apply their limit afterwards, so a filter can never hide matches
@@ -292,24 +322,64 @@ export class SearchIndex {
      */
     search(terms: string[]): SearchHit[] {
         if (terms.length === 0) return [];
-        const lists = terms.map((t) => this.postings.get(t));
-        if (lists.some((l) => !l)) return [];
-        // Intersect starting from the rarest term: cheapest, and shrinks fastest.
-        const ordered = (lists as Map<string, number>[]).slice().sort((a, b) => a.size - b.size);
-        const n = this.knownPaths.size;
+        // Per query word: note -> its best score for that word. A note must
+        // appear in every one of these maps to match (AND across words, any
+        // expansion within a word).
+        const perTerm = terms.map((t) => this.scoreTerm(t));
+        if (perTerm.some((m) => m.size === 0)) return [];
+        // Intersect starting from the smallest: cheapest, and shrinks fastest.
+        const ordered = perTerm.slice().sort((a, b) => a.size - b.size);
         const hits: SearchHit[] = [];
-        for (const path of ordered[0].keys()) {
-            if (!ordered.every((l) => l.has(path))) continue;
-            const nameTerms = tokenize(basenameText(path));
+        for (const [path] of ordered[0]) {
             let score = 0;
-            for (let i = 0; i < terms.length; i++) {
-                const idf = Math.log(1 + n / lists[i]!.size);
-                score += (1 + Math.log(lists[i]!.get(path)!)) * idf;
-                if (nameTerms.has(terms[i])) score += idf;
+            let all = true;
+            for (const m of ordered) {
+                const s = m.get(path);
+                if (s === undefined) { all = false; break; }
+                score += s;
             }
-            hits.push({ path, score });
+            if (all) hits.push({ path, score });
         }
         return hits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+    }
+
+    /**
+     * Every note matching one query word, with that word's contribution to its
+     * score. The word expands to all indexed words starting with its stem;
+     * an exact hit weighs fully, an expansion PREFIX_WEIGHT of that, and each
+     * is (1 + log tf) * log(1 + N / df) for the indexed word that matched, so a
+     * rare expansion still counts for more than a common one. A matched word
+     * in the filename adds its IDF again. A note keeps its best expansion.
+     *
+     * The vocabulary is scanned linearly. On a personal vault that is a few
+     * thousand to a few tens of thousands of words — about a millisecond —
+     * which is cheaper to live with than a second, sorted index to maintain.
+     */
+    private scoreTerm(term: string): Map<string, number> {
+        const expansions: string[] = [];
+        if (term.length < MIN_PREFIX_LEN) {
+            if (this.postings.has(term)) expansions.push(term);
+        } else {
+            const stem = stemOf(term);
+            for (const word of this.postings.keys()) {
+                if (word.startsWith(stem)) expansions.push(word);
+            }
+        }
+        const n = this.knownPaths.size;
+        const scores = new Map<string, number>();
+        const nameTermsCache = new Map<string, Map<string, number>>();
+        for (const word of expansions) {
+            const notes = this.postings.get(word)!;
+            const idf = Math.log(1 + n / notes.size);
+            const weight = word === term ? 1 : PREFIX_WEIGHT;
+            for (const [path, tf] of notes) {
+                let nameTerms = nameTermsCache.get(path);
+                if (!nameTerms) nameTermsCache.set(path, (nameTerms = tokenize(basenameText(path))));
+                const s = weight * ((1 + Math.log(tf)) * idf + (nameTerms.has(word) ? idf : 0));
+                if (s > (scores.get(path) ?? 0)) scores.set(path, s);
+            }
+        }
+        return scores;
     }
 
     /** Remove all backlink entries where path is the source. */
