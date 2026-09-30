@@ -1,8 +1,15 @@
 /**
- * Metadata index for vault notes with full-text search.
+ * Metadata index for vault notes, with a full-text inverted index.
  *
- * Tracks paths, mtimes, tags, links, backlinks, and a term inverted index.
+ * Tracks paths, mtimes, tags, links, backlinks, and term -> notes postings.
  * Persists to disk (encrypted if passphrase is set).
+ *
+ * The inverted index keeps every term, including ones that occur in a single
+ * note. A word unique to one note is the most useful thing a user can search
+ * for, so pruning rare terms to save memory would delete exactly the entries
+ * that make search worth having. Memory therefore grows with the vault's
+ * vocabulary — fine for personal vaults, and the reason 0.5.0 removed the
+ * FlexSearch index for very large ones.
  */
 
 import { readFile, writeFile, mkdir, chmod } from "fs/promises";
@@ -10,10 +17,7 @@ import { dirname } from "path";
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "crypto";
 import { parseFrontmatterAndLinks, maskCode } from "./parse.js";
 
-
-// ---------------------------------------------------------------------------
-// Stop words — common English words that carry little search value.
-// ---------------------------------------------------------------------------
+/** Common English words that carry little search value. Dropped from notes and queries alike. */
 const STOP_WORDS = new Set([
     "the","and","is","at","which","on","a","an","of","to","in","for","it","this","that",
     "with","as","by","from","or","be","are","was","were","been","being","have","has","had",
@@ -21,70 +25,66 @@ const STOP_WORDS = new Set([
     "no","nor","but","if","then","than","so","yet","both","either","neither","each",
     "every","all","any","few","more","most","other","some","such","only","own","same",
     "too","very","just","about","above","after","again","against","am","around","because",
-    "before","being","below","between","beyond","during","further","had","here","how",
-    "i","into","many","me","most","my","myself","once","out","over","per","please",
+    "before","below","between","beyond","during","further","here","how",
+    "i","into","many","me","my","myself","once","out","over","per","please",
     "re","rather","said","say","says","she","since","still","take","tell","them",
-    "then","there","these","they","through","under","until","up","upon","us","we",
+    "there","these","they","through","under","until","up","upon","us","we",
     "what","when","where","while","who","whom","why","you","your",
 ]);
 
+/** Most terms one query may contribute; each one is a postings lookup and a scoring pass. */
+export const MAX_QUERY_TERMS = 32;
+
 /**
- * Tokenize note content into a term-frequency map.
+ * Case-fold one term, one code point at a time.
  *
- * 1. Lowercase
- * 2. Strip fenced code blocks and inline code (maskCode)
- * 3. Strip wikilinks [[...]] and markdown links [...](...)
- * 4. Split on word boundaries
- * 5. Drop empty, pure numbers, and stop words
+ * `String#toLowerCase` is context-sensitive: `"ΟΔΟΣ".toLowerCase()` ends in a
+ * final sigma, `"οδοσ"` typed by a user ends in a medial one, and the two
+ * would never meet in the index. Folding each code point on its own (upper
+ * then lower) maps every case variant of a letter — σ/ς/Σ, µ/μ, ſ/s — to one
+ * form, on the note side and the query side identically.
  */
-function tokenize(content: string): Map<string, number> {
+export function foldTerm(term: string): string {
+    let out = "";
+    for (const ch of term) out += ch.toUpperCase().toLowerCase();
+    return out;
+}
+
+const WORD_RE = /[\p{L}\p{M}\p{N}_]+/gu;
+
+/**
+ * Term frequencies for a piece of text.
+ *
+ * NFC-normalized first, so a note saved decomposed (macOS) and a query typed
+ * composed produce the same terms. Code blocks and inline code are masked, and
+ * the URL half of a markdown link is dropped — but link TEXT is kept, both for
+ * `[text](url)` and `[[target|alias]]`, because it is part of what the note says.
+ */
+export function tokenize(text: string): Map<string, number> {
     const freq = new Map<string, number>();
-    let text = maskCode(content).toLowerCase();
-    // Strip wikilinks: [[...]]  (keep nothing — the link text is already a path)
-    text = text.replace(/\[\[[^\]]*\]\]/g, " ");
-    // Strip markdown links: [text](url)
-    text = text.replace(/\[[^\]]*\]\([^)]*\)/g, " ");
-    // Split on word boundaries
-    const words = text.split(/[^\p{L}\p{N}_]+/u);
-    for (const w of words) {
-        if (w === "") continue;
-        if (/^\d+$/.test(w)) continue;          // pure numbers
-        if (STOP_WORDS.has(w)) continue;         // stop words
-        freq.set(w, (freq.get(w) ?? 0) + 1);
+    const cleaned = maskCode(text.normalize("NFC")).replace(/\]\([^)]*\)/g, "] ");
+    for (const m of cleaned.matchAll(WORD_RE)) {
+        const term = foldTerm(m[0]);
+        if (STOP_WORDS.has(term)) continue;
+        freq.set(term, (freq.get(term) ?? 0) + 1);
     }
     return freq;
 }
 
-/**
- * Remove a single path from every term set it belongs to.
- * Returns the number of sets that were emptied (and should be deleted).
- */
-function removePathFromTerms(terms: Map<string, Set<string>>, path: string): number {
-    let emptyCount = 0;
-    for (const [term, paths] of terms) {
-        if (paths.has(path)) {
-            paths.delete(path);
-            if (paths.size === 0) {
-                terms.delete(term);
-                emptyCount++;
-            }
-        }
-    }
-    return emptyCount;
+/** Distinct searchable terms of a query, in order, capped at MAX_QUERY_TERMS. */
+export function queryTerms(query: string): string[] {
+    return [...tokenize(query).keys()].slice(0, MAX_QUERY_TERMS);
 }
 
-/**
- * Post-index pass: remove terms that appear in fewer than `minFreq` notes.
- */
-function cleanupMinTermFreq(terms: Map<string, Set<string>>, minFreq: number): number {
-    let removed = 0;
-    for (const [term, paths] of terms) {
-        if (paths.size < minFreq) {
-            terms.delete(term);
-            removed++;
-        }
-    }
-    return removed;
+/** Filename without folders or extension — indexed alongside the body. */
+function basenameText(path: string): string {
+    const name = path.slice(path.lastIndexOf("/") + 1);
+    return name.endsWith(".md") ? name.slice(0, -3) : name;
+}
+
+export interface SearchHit {
+    path: string;
+    score: number;
 }
 
 
@@ -120,15 +120,15 @@ export class SearchIndex {
     private links = new Map<string, string[]>();
     private backlinks = new Map<string, Set<string>>();
     private knownPaths = new Set<string>();
-
-    // -- Full-text term inverted index ----------------------------------------
-    /** term → set of paths containing that term */
-    private terms = new Map<string, Set<string>>();
-
-    /** Count of incremental updates since last cleanup. */
-    private _incrementalUpdates = 0;
-    private _lastCleanupIndex = 0;
-
+    /** term -> (note -> occurrences of the term in that note). */
+    private postings = new Map<string, Map<string, number>>();
+    /**
+     * note -> its distinct terms. The reverse of `postings`, so re-indexing or
+     * removing a note touches only that note's own terms instead of walking the
+     * whole vocabulary. A plain array rather than a Map: counts already live in
+     * the postings, and a per-note Map doubled the index's heap.
+     */
+    private noteTerms = new Map<string, string[]>();
     private saving = false;
     private _since: string = "";
     private persistPath: string | null;
@@ -138,8 +138,6 @@ export class SearchIndex {
         this.persistPath = persistPath ?? null;
         this.passphrase = passphrase ?? null;
     }
-
-    // -- Serialization -------------------------------------------------------
 
     /** Load metadata from disk. */
     async loadFromDisk(): Promise<boolean> {
@@ -166,15 +164,22 @@ export class SearchIndex {
                     this.backlinks.get(key)!.add(path);
                 }
             }
-            // Load term inverted index.
-            const rawTerms = data.terms as Record<string, string[]> | undefined;
-            if (rawTerms) {
-                for (const [term, paths] of Object.entries(rawTerms)) {
-                    this.terms.set(term, new Set(paths));
-                }
-            }
             if (data.since) this._since = data.since;
-            console.log(`Search metadata loaded from disk (${this.knownPaths.size} notes, ${this.terms.size} terms, since: ${this._since ? "yes" : "none"}).`);
+            // An index written before full-text search existed (0.7.0 and
+            // earlier) knows the notes but not their terms. Loading it would
+            // make every search come back empty, and in CouchDB mode catch-up
+            // only replays changes since `since`, so it would never heal.
+            // Report "nothing persisted" instead, which triggers a full rebuild.
+            const persistedTerms = (data.noteTerms ?? null) as Record<string, Record<string, number>> | null;
+            if (this.knownPaths.size > 0 && (!persistedTerms || [...this.knownPaths].some((p) => !(p in persistedTerms)))) {
+                console.warn("Search index has no full-text terms for some notes (upgrading from an older version?); rebuilding.");
+                this.clear();
+                return false;
+            }
+            for (const [path, freq] of Object.entries(persistedTerms ?? {})) {
+                if (this.knownPaths.has(path)) this.addTerms(path, new Map(Object.entries(freq)));
+            }
+            console.log(`Search metadata loaded from disk (${this.knownPaths.size} notes, ${this.postings.size} terms, since: ${this._since ? "yes" : "none"}).`);
             return this.knownPaths.size > 0;
         } catch {
             return false;
@@ -187,16 +192,13 @@ export class SearchIndex {
         this.saving = true;
         try {
             await mkdir(dirname(this.persistPath), { recursive: true });
-            // Convert Map<string, Set<string>> → Object<string, string[]> for JSON.
-            const termsObj: Record<string, string[]> = {};
-            for (const [term, paths] of this.terms) {
-                termsObj[term] = [...paths];
-            }
             let data = JSON.stringify({
                 mtimes: Object.fromEntries(this.mtimes),
                 tags: Object.fromEntries(this.tags),
                 links: Object.fromEntries(this.links),
-                terms: termsObj,
+                noteTerms: Object.fromEntries(
+                    [...this.noteTerms].map(([p, terms]) => [p, Object.fromEntries(terms.map((t) => [t, this.postings.get(t)!.get(p)!]))]),
+                ),
                 since: this._since,
             });
             if (this.passphrase) {
@@ -204,7 +206,7 @@ export class SearchIndex {
             }
             await writeFile(this.persistPath, data, { encoding: "utf-8", mode: 0o600 });
             await chmod(this.persistPath, 0o600);
-            console.log(`Search index saved to disk (${this.knownPaths.size} notes, ${this.terms.size} terms${this.passphrase ? ", encrypted" : ""}).`);
+            console.log(`Search index saved to disk (${this.knownPaths.size} notes${this.passphrase ? ", encrypted" : ""}).`);
         } catch (err) {
             console.error("Failed to save search index:", err);
         } finally {
@@ -212,16 +214,18 @@ export class SearchIndex {
         }
     }
 
-    // -- Core index operations -----------------------------------------------
-
     /** Add or update a note in the index. */
     update(path: string, content: string, mtime?: number): void {
         if (this.knownPaths.has(path)) {
             this.clearBacklinks(path);
-            // Remove old terms for this path before re-indexing.
-            removePathFromTerms(this.terms, path);
+            this.removeTerms(path);
         }
         this.knownPaths.add(path);
+        const freq = tokenize(content);
+        for (const [term, count] of tokenize(basenameText(path))) {
+            freq.set(term, (freq.get(term) ?? 0) + count);
+        }
+        this.addTerms(path, freq);
         if (mtime !== undefined) this.mtimes.set(path, mtime);
         const parsed = parseFrontmatterAndLinks(content);
         if (parsed.tags.length > 0) {
@@ -239,18 +243,6 @@ export class SearchIndex {
         } else {
             this.links.delete(path);
         }
-        // Index full-text terms.
-        const freq = tokenize(content);
-        for (const [term, count] of freq) {
-            let set = this.terms.get(term);
-            if (!set) {
-                set = new Set();
-                this.terms.set(term, set);
-            }
-            set.add(path);
-        }
-        // Track incremental updates for periodic cleanup.
-        this._incrementalUpdates++;
     }
 
     /** Remove a note from the index. */
@@ -260,9 +252,64 @@ export class SearchIndex {
             this.mtimes.delete(path);
             this.tags.delete(path);
             this.clearBacklinks(path);
-            // Clean up terms that referenced this path.
-            removePathFromTerms(this.terms, path);
+            this.removeTerms(path);
         }
+    }
+
+    private addTerms(path: string, freq: Map<string, number>): void {
+        this.noteTerms.set(path, [...freq.keys()]);
+        for (const [term, count] of freq) {
+            let notes = this.postings.get(term);
+            if (!notes) this.postings.set(term, (notes = new Map()));
+            notes.set(path, count);
+        }
+    }
+
+    private removeTerms(path: string): void {
+        const terms = this.noteTerms.get(path);
+        if (!terms) return;
+        for (const term of terms) {
+            const notes = this.postings.get(term);
+            notes?.delete(path);
+            if (notes?.size === 0) this.postings.delete(term);
+        }
+        this.noteTerms.delete(path);
+    }
+
+    /**
+     * Every note containing ALL query terms, best first.
+     *
+     * Strict AND: a note missing any term is not a match, so a multi-word query
+     * narrows instead of quietly widening to "any of these words".
+     *
+     * Score per term is (1 + log tf) * log(1 + N / df): rare terms weigh more,
+     * repetition helps with diminishing returns. A term that also appears in
+     * the filename counts double. Ties go to the path, so results are stable.
+     *
+     * Returns all matches, unsliced: callers filter by folder/tag/date first
+     * and apply their limit afterwards, so a filter can never hide matches
+     * that happened to rank below an unfiltered cutoff.
+     */
+    search(terms: string[]): SearchHit[] {
+        if (terms.length === 0) return [];
+        const lists = terms.map((t) => this.postings.get(t));
+        if (lists.some((l) => !l)) return [];
+        // Intersect starting from the rarest term: cheapest, and shrinks fastest.
+        const ordered = (lists as Map<string, number>[]).slice().sort((a, b) => a.size - b.size);
+        const n = this.knownPaths.size;
+        const hits: SearchHit[] = [];
+        for (const path of ordered[0].keys()) {
+            if (!ordered.every((l) => l.has(path))) continue;
+            const nameTerms = tokenize(basenameText(path));
+            let score = 0;
+            for (let i = 0; i < terms.length; i++) {
+                const idf = Math.log(1 + n / lists[i]!.size);
+                score += (1 + Math.log(lists[i]!.get(path)!)) * idf;
+                if (nameTerms.has(terms[i])) score += idf;
+            }
+            hits.push({ path, score });
+        }
+        return hits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
     }
 
     /** Remove all backlink entries where path is the source. */
@@ -277,81 +324,6 @@ export class SearchIndex {
         }
         this.links.delete(path);
     }
-
-    // -- Search --------------------------------------------------------------
-
-    /**
-     * Search note content across the vault.
-     *
-     * Uses AND semantics (all terms must match).  If the AND intersection is
-     * empty the query falls back to OR (any term matches).
-     *
-     * Results are scored by inverse document frequency (IDF): rare terms that
-     * appear in fewer notes contribute more to the score.
-     */
-    search(query: string, folder?: string, limit: number = 10): Array<{ path: string; score: number }> {
-        const queryTerms = tokenize(query);
-        if (queryTerms.size === 0) return [];
-
-        // Snapshot terms at the start to avoid race conditions with concurrent
-        // incremental updates during file-watcher events.
-        const termsSnapshot = new Map(this.terms);
-
-        const termsArr = [...queryTerms.keys()];
-
-        // AND: intersect all term sets.
-        let candidatePaths: Set<string> | null = null;
-        for (const term of termsArr) {
-            const set = termsSnapshot.get(term);
-            if (!set || set.size === 0) {
-                candidatePaths = null;
-                break;
-            }
-            if (candidatePaths === null) {
-                candidatePaths = new Set(set);
-            } else {
-                // In-place intersection.
-                for (const p of candidatePaths) {
-                    if (!set.has(p)) candidatePaths.delete(p);
-                }
-            }
-        }
-
-        // OR fallback: union of all term sets.
-        if (!candidatePaths || candidatePaths.size === 0) {
-            candidatePaths = new Set();
-            for (const term of termsArr) {
-                const set = termsSnapshot.get(term);
-                if (set) {
-                    for (const p of set) candidatePaths.add(p);
-                }
-            }
-        }
-
-        // Score each candidate by IDF-style weighting: 1 / set.size.
-        // Rare terms that appear in fewer notes score higher.
-        const scored = new Map<string, number>();
-        for (const path of candidatePaths) {
-            let score = 0;
-            for (const term of termsArr) {
-                const set = termsSnapshot.get(term);
-                if (set && set.has(path)) {
-                    score += 1 / set.size;
-                }
-            }
-            scored.set(path, score);
-        }
-
-        // Filter by folder prefix if provided.
-        const prefix = folder && !folder.endsWith("/") ? folder + "/" : folder;
-        const filtered = [...scored.entries()]
-            .filter(([p]) => !prefix || p.startsWith(prefix))
-            .sort((a, b) => b[1] - a[1]);
-
-        return filtered.slice(0, limit).map(([path, score]) => ({ path, score }));
-    }
-
-    // -- List helpers --------------------------------------------------------
 
     /** List all indexed paths, optionally filtered by folder prefix. */
     listPaths(folder?: string): string[] {
@@ -412,43 +384,15 @@ export class SearchIndex {
             .sort((a, b) => b.count - a.count);
     }
 
-    /**
-     * Post-index cleanup: remove terms that appear in fewer than minFreq notes.
-     * Call this after the full rebuild to prune rare terms.
-     *
-     * Also called automatically after every `autoCleanupEvery` incremental
-     * updates (default 500) to prevent rare-term accumulation.
-     */
-    cleanupMinTermFreq(minFreq: number): number {
-        const removed = cleanupMinTermFreq(this.terms, minFreq);
-        if (removed > 0) {
-            console.log(`  pruned ${removed} rare terms from inverted index.`);
-        }
-        this._incrementalUpdates = 0;
-        this._lastCleanupIndex++;
-        return removed;
-    }
-
-    /**
-     * Check if incremental updates warrant a cleanup pass.
-     * Call this after each update() in the file-watcher callback.
-     */
-    maybeCleanup(minFreq: number, autoCleanupEvery: number = 500): void {
-        if (this._incrementalUpdates >= autoCleanupEvery) {
-            this.cleanupMinTermFreq(minFreq);
-        }
-    }
-
     /** Clear all index data (for full rebuild after DB nuke). */
     clear(): void {
         const paths = Array.from(this.knownPaths);
         for (const p of paths) this.remove(p);
-        this.terms.clear();
+        this.postings.clear();
+        this.noteTerms.clear();
         this._since = "";
         this._state = "building";
     }
-
-    // -- Getters -------------------------------------------------------------
 
     get state(): IndexState {
         return this._state;
@@ -470,8 +414,8 @@ export class SearchIndex {
         return this.knownPaths.size;
     }
 
-    /** Number of unique terms in the inverted index. */
-    get termsSize(): number {
-        return this.terms.size;
+    /** Distinct terms in the full-text index. */
+    get termCount(): number {
+        return this.postings.size;
     }
 }

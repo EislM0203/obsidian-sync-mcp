@@ -171,11 +171,6 @@ async function rebuildIndex() {
             console.log(`Search index built: ${searchIndex.size} notes in ${((performance.now() - start) / 1000).toFixed(1)}s`);
         }
     }
-    // Prune rare terms (appear in < 2 notes) to keep the index lean.
-    const pruned = searchIndex.cleanupMinTermFreq(2);
-    if (pruned > 0) {
-        console.log(`  pruned ${pruned} rare terms from inverted index.`);
-    }
     await searchIndex.saveToDisk();
     searchIndex.state = "ready";
 }
@@ -207,7 +202,6 @@ if (VAULT_PATH) {
             if (content !== null) {
                 const s = await stat(join(VAULT_PATH!, notePath));
                 searchIndex.update(notePath, content, s.mtimeMs);
-                searchIndex.maybeCleanup(2);
             } else {
                 searchIndex.remove(notePath);
             }
@@ -224,7 +218,6 @@ if (VAULT_PATH) {
         // content === "" is an empty-but-present note: index it, don't drop it.
         applyIndexChange(searchIndex, path, content, mtime);
         if (seq) searchIndex.since = String(seq);
-        searchIndex.maybeCleanup(2);
     });
     console.log("Watching CouchDB for LiveSync changes.");
 }

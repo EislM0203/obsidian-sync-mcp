@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- **`search_vault` is back** — full-text search across note content and filenames, removed in 0.5.0. Every word must match (AND), case-insensitively; common words and code blocks are ignored; results are ranked by how rare and how frequent the matched words are, with filename hits first, and each comes with a snippet. Filter with `folder`, `tag`, or `modified_after`. A search reads only the notes it returns.
+- The index is persisted with the rest of the search metadata, so a restart does not re-read the vault. An index from 0.7.0 or earlier is rebuilt automatically on first start.
+
+### Notes
+- The index keeps every word, so memory grows with the vault — about 18 MB per 1,000 notes. Fine for personal vaults; very large vaults are the case that led to 0.5.0 removing search.
+- The persisted index now contains each note's vocabulary. It is encrypted with `COUCHDB_PASSPHRASE` when set; in filesystem mode it is plaintext, as the metadata index always was.
+
+### Tests
+- The e2e suite uses an isolated `DATA_DIR` instead of the real `~/.obsidian-mcp`, where a leftover index from an earlier run could change what the next run asserted.
+
 ## 0.7.0
 
 ### Features

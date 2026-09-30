@@ -206,11 +206,23 @@ Set `BASE_URL` to the tunnel URL when using authentication.
 | `list_folders` | List all folders in the vault with note counts — use to discover folder names |
 | `list_tags` | List all tags in the vault with counts — use to discover tags before filtering |
 | `list_notes` | List notes with timestamps. Filter by folder, name, tag, or date. Sort by name or modified. |
+| `search_vault` | Full-text search across note content and filenames, ranked, with a snippet per hit. Narrow with folder, tag, or date. |
 | `delete_note` | Delete a note |
 | `move_note` | Move or rename a note — works across folders, creates destination folders automatically |
 | `get_note_metadata` | Get frontmatter, tags, outgoing links, backlinks, size, and timestamps — navigate the knowledge graph |
 
 Every tool response includes an [Obsidian deep link](https://help.obsidian.md/Extending+Obsidian/Obsidian+URI) (`obsidian://open?vault=...&file=...`) that works on Mac and iOS.
+
+### Search
+
+`search_vault` matches whole words, case-insensitively, and every word must appear in a note (AND). Common words like "the" and "and" are ignored, and so is text inside code blocks. Filenames are searched alongside content, and a filename hit ranks higher. Results are ranked so that rare words and repeated words count for more.
+
+```
+search_vault(query="quarterly budget")
+search_vault(query="kubernetes", folder="work", tag="infra", modified_after="2026-01-01")
+```
+
+The index keeps every word of every note, including words that appear only once, so its memory grows with your vault: measured at about 18 MB for 1,000 notes and about 100 MB for 10,000 (4 KB each). A search reads only the notes it returns, to cut their snippets.
 
 > "Add a bullet point to my daily note." "Find my notes about the MCP server and fix the typo in the second one."
 

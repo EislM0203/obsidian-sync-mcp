@@ -33,20 +33,44 @@ The MCP server sits between CouchDB (or the local filesystem) and AI agents. It 
 A single `SearchIndex` class manages all indexed data in memory:
 
 ```
-(no full-text search — metadata only)
 knownPaths: Set<string>   ─── all indexed note paths
 mtimes: Map<path, number> ─── modification timestamps
 tags: Map<path, string[]> ─── extracted from frontmatter + inline #tags
 links: Map<path, string[]>── outgoing [[wikilinks]] and [markdown](links.md)
 backlinks: Map<target, Set<source>> ─── reverse link index (case-insensitive keys)
+postings: Map<term, Map<path, count>> ─── full-text inverted index
+noteTerms: Map<path, term[]>          ─── reverse map, so re-indexing a note touches only its own terms
 since: string             ─── CouchDB _changes sequence (CouchDB mode only)
 ```
+
+### Full-text search
+
+Notes are tokenized after NFC normalization, with code masked, link URLs
+dropped (link text kept) and stop words removed. Each word is case-folded one
+code point at a time rather than with `toLowerCase`, which is context-sensitive
+(Greek final sigma) and would stop a query from meeting the indexed form of
+the same word. The filename is indexed alongside the body.
+
+`search(terms)` is strict AND, intersecting postings from the rarest term up.
+Score per term is `(1 + log tf) * log(1 + N / df)`, with a filename hit adding
+the term's IDF again. It returns every match; the tool filters by folder, tag
+and date *before* applying the limit, then reads only the shown notes for
+snippets — so a query costs at most `limit` reads.
+
+Every term is kept, including terms seen in a single note: those are the most
+valuable searches there are, and pruning them to save memory would delete
+exactly what makes search useful. Memory therefore grows with vocabulary —
+about 18 MB per 1,000 notes of 4 KB prose, 100 MB at 10,000. That suits
+personal vaults; it is the same shape that made 0.5.0 remove FlexSearch for
+very large ones.
 
 ### Persistence
 
 Everything is serialized to a single JSON file at `DATA_DIR/<vault-hash>/search-index.json`:
-- No full-text index (removed FlexSearch for memory efficiency)
-- Metadata (mtimes, tags, links, since)
+- Metadata (mtimes, tags, links, since) and each note's term counts
+- An index with notes but no terms (written by 0.7.0 or earlier) is discarded
+  and rebuilt — otherwise every search would return nothing, and CouchDB
+  catch-up, which replays only changes since `since`, would never fill it in
 - Encrypted with AES-256-GCM when `COUCHDB_PASSPHRASE` is set
 - Saved every 5 minutes + on graceful shutdown
 - Concurrent saves guarded by a lock flag
@@ -148,10 +172,10 @@ Agent connects → /oauth/authorize → password page → /oauth/approve
 | `list_notes` | index (fallback: vault) | — |
 | `list_folders` | index (fallback: vault) | — |
 | `list_tags` | index | — |
-| `search_vault` | index + vault (for snippets) | — |
+| `search_vault` | index + vault (snippets for shown results only) | — |
 | `get_note_metadata` | vault + index (backlinks) | — |
 | `move_note` | vault | vault + index |
-| `delete_note` | — | vault + index |
+| `delete_note` | vault | vault + index |
 
 ## Build (`tsup.config.ts`)
 

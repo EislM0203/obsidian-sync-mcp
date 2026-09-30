@@ -62,7 +62,8 @@ The server implements a self-contained OAuth 2.1 authorization server with PKCE.
 - **E2E encryption supported** — when `COUCHDB_PASSPHRASE` is set, the server decrypts and encrypts vault data using the same scheme as Self-hosted LiveSync. Data is encrypted at rest in CouchDB.
 - **Text only** — binary attachments are not exposed through MCP tools, reducing the attack surface.
 - **Search result cap** — search results are limited to 50 matches, preventing large responses from exhausting memory or leaking excessive content.
-- **Search index encryption** — the persisted search metadata (paths and timestamps) is encrypted at rest using `COUCHDB_PASSPHRASE` when set. Note content is not persisted — only the FlexSearch tokenized index lives in memory (lost on full restart, rebuilt from vault). Content snippets are fetched on demand from the vault, not cached.
+- **Search index encryption** — the persisted search index is encrypted at rest using `COUCHDB_PASSPHRASE` when set. It holds paths, timestamps, tags, links, and **the vocabulary of every note**: which words each note contains and how often. That is not the note text, but it reveals most of what a note is about. In filesystem mode there is no passphrase, so the index is plaintext on disk — protect `DATA_DIR` accordingly. Snippets are read from the vault on demand and not cached.
+- **Search query limits** — queries are capped at 512 characters and 32 terms, and truncated where they are echoed back.
 
 ---
 
