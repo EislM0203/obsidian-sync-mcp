@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: obsidian-sync-mcp
+spec:
+  selector:
+    app.kubernetes.io/name: obsidian-sync-mcp
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
