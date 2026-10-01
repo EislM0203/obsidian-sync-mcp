@@ -1,15 +1,122 @@
 /**
- * Metadata index for vault notes.
+ * Metadata index for vault notes, with a full-text inverted index.
  *
- * Tracks paths, mtimes, tags, links, and backlinks.
+ * Tracks paths, mtimes, tags, links, backlinks, and term -> notes postings.
  * Persists to disk (encrypted if passphrase is set).
- * No full-text search — metadata only.
+ *
+ * The inverted index keeps every term, including ones that occur in a single
+ * note. A word unique to one note is the most useful thing a user can search
+ * for, so pruning rare terms to save memory would delete exactly the entries
+ * that make search worth having. Memory therefore grows with the vault's
+ * vocabulary — fine for personal vaults, and the reason 0.5.0 removed the
+ * FlexSearch index for very large ones.
  */
 
 import { readFile, writeFile, mkdir, chmod } from "fs/promises";
 import { dirname } from "path";
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "crypto";
-import { parseFrontmatterAndLinks } from "./parse.js";
+import { parseFrontmatterAndLinks, maskCode } from "./parse.js";
+
+/** Common English words that carry little search value. Dropped from notes and queries alike. */
+const STOP_WORDS = new Set([
+    "the","and","is","at","which","on","a","an","of","to","in","for","it","this","that",
+    "with","as","by","from","or","be","are","was","were","been","being","have","has","had",
+    "do","does","did","will","would","could","should","may","might","can","shall","not",
+    "no","nor","but","if","then","than","so","yet","both","either","neither","each",
+    "every","all","any","few","more","most","other","some","such","only","own","same",
+    "too","very","just","about","above","after","again","against","am","around","because",
+    "before","below","between","beyond","during","further","here","how",
+    "i","into","many","me","my","myself","once","out","over","per","please",
+    "re","rather","said","say","says","she","since","still","take","tell","them",
+    "there","these","they","through","under","until","up","upon","us","we",
+    "what","when","where","while","who","whom","why","you","your",
+]);
+
+/** Most terms one query may contribute; each one is a postings lookup and a scoring pass. */
+export const MAX_QUERY_TERMS = 32;
+
+/**
+ * Case-fold one term, one code point at a time.
+ *
+ * `String#toLowerCase` is context-sensitive: `"ΟΔΟΣ".toLowerCase()` ends in a
+ * final sigma, `"οδοσ"` typed by a user ends in a medial one, and the two
+ * would never meet in the index. Folding each code point on its own (upper
+ * then lower) maps every case variant of a letter — σ/ς/Σ, µ/μ, ſ/s — to one
+ * form, on the note side and the query side identically.
+ */
+export function foldTerm(term: string): string {
+    let out = "";
+    for (const ch of term) out += ch.toUpperCase().toLowerCase();
+    return out;
+}
+
+const WORD_RE = /[\p{L}\p{M}\p{N}_]+/gu;
+
+/**
+ * Term frequencies for a piece of text.
+ *
+ * NFC-normalized first, so a note saved decomposed (macOS) and a query typed
+ * composed produce the same terms. Code blocks and inline code are masked, and
+ * the URL half of a markdown link is dropped — but link TEXT is kept, both for
+ * `[text](url)` and `[[target|alias]]`, because it is part of what the note says.
+ */
+export function tokenize(text: string): Map<string, number> {
+    const freq = new Map<string, number>();
+    const cleaned = maskCode(text.normalize("NFC")).replace(/\]\([^)]*\)/g, "] ");
+    for (const m of cleaned.matchAll(WORD_RE)) {
+        const term = foldTerm(m[0]);
+        if (STOP_WORDS.has(term)) continue;
+        freq.set(term, (freq.get(term) ?? 0) + 1);
+    }
+    return freq;
+}
+
+/** Distinct searchable terms of a query, in order, capped at MAX_QUERY_TERMS. */
+export function queryTerms(query: string): string[] {
+    return [...tokenize(query).keys()].slice(0, MAX_QUERY_TERMS);
+}
+
+/** Shortest query word that expands to the indexed words it prefixes. Shorter words match exactly. */
+export const MIN_PREFIX_LEN = 3;
+
+/** How much a prefix or stemmed match counts relative to an exact one. */
+const PREFIX_WEIGHT = 0.6;
+
+/**
+ * The stem a query word expands from: a trailing inflection is stripped so
+ * `meetings` also finds `meeting` and `deployed` finds `deploying`, then every
+ * indexed word starting with the stem matches.
+ *
+ * Deliberately crude — four suffixes, no dictionary — because a query that
+ * over-matches a little is recoverable (the model reads the snippets) and an
+ * opaque stemmer is not. Two guards keep it from over-reaching: the stem must
+ * stay at least four characters (`used` does not become `us`), and `es` is
+ * only removed where English adds it (`boxes`, `watches`), so `notes` does not
+ * collapse to `not` and match `nothing`.
+ */
+export function stemOf(term: string): string {
+    const rules: [RegExp, number][] = [
+        [/ing$/, 3],
+        [/ed$/, 2],
+        [/(?:s|x|z|ch|sh)es$/, 2],
+        [/[^s]s$/, 1],
+    ];
+    for (const [re, cut] of rules) {
+        if (re.test(term) && term.length - cut >= 4) return term.slice(0, -cut);
+    }
+    return term;
+}
+
+/** Filename without folders or extension — indexed alongside the body. */
+function basenameText(path: string): string {
+    const name = path.slice(path.lastIndexOf("/") + 1);
+    return name.endsWith(".md") ? name.slice(0, -3) : name;
+}
+
+export interface SearchHit {
+    path: string;
+    score: number;
+}
 
 
 function encrypt(text: string, passphrase: string): string {
@@ -44,6 +151,15 @@ export class SearchIndex {
     private links = new Map<string, string[]>();
     private backlinks = new Map<string, Set<string>>();
     private knownPaths = new Set<string>();
+    /** term -> (note -> occurrences of the term in that note). */
+    private postings = new Map<string, Map<string, number>>();
+    /**
+     * note -> its distinct terms. The reverse of `postings`, so re-indexing or
+     * removing a note touches only that note's own terms instead of walking the
+     * whole vocabulary. A plain array rather than a Map: counts already live in
+     * the postings, and a per-note Map doubled the index's heap.
+     */
+    private noteTerms = new Map<string, string[]>();
     private saving = false;
     private _since: string = "";
     private persistPath: string | null;
@@ -80,7 +196,21 @@ export class SearchIndex {
                 }
             }
             if (data.since) this._since = data.since;
-            console.log(`Search metadata loaded from disk (${this.knownPaths.size} notes, since: ${this._since ? "yes" : "none"}).`);
+            // An index written before full-text search existed (0.7.0 and
+            // earlier) knows the notes but not their terms. Loading it would
+            // make every search come back empty, and in CouchDB mode catch-up
+            // only replays changes since `since`, so it would never heal.
+            // Report "nothing persisted" instead, which triggers a full rebuild.
+            const persistedTerms = (data.noteTerms ?? null) as Record<string, Record<string, number>> | null;
+            if (this.knownPaths.size > 0 && (!persistedTerms || [...this.knownPaths].some((p) => !(p in persistedTerms)))) {
+                console.warn("Search index has no full-text terms for some notes (upgrading from an older version?); rebuilding.");
+                this.clear();
+                return false;
+            }
+            for (const [path, freq] of Object.entries(persistedTerms ?? {})) {
+                if (this.knownPaths.has(path)) this.addTerms(path, new Map(Object.entries(freq)));
+            }
+            console.log(`Search metadata loaded from disk (${this.knownPaths.size} notes, ${this.postings.size} terms, since: ${this._since ? "yes" : "none"}).`);
             return this.knownPaths.size > 0;
         } catch {
             return false;
@@ -97,6 +227,9 @@ export class SearchIndex {
                 mtimes: Object.fromEntries(this.mtimes),
                 tags: Object.fromEntries(this.tags),
                 links: Object.fromEntries(this.links),
+                noteTerms: Object.fromEntries(
+                    [...this.noteTerms].map(([p, terms]) => [p, Object.fromEntries(terms.map((t) => [t, this.postings.get(t)!.get(p)!]))]),
+                ),
                 since: this._since,
             });
             if (this.passphrase) {
@@ -116,8 +249,14 @@ export class SearchIndex {
     update(path: string, content: string, mtime?: number): void {
         if (this.knownPaths.has(path)) {
             this.clearBacklinks(path);
+            this.removeTerms(path);
         }
         this.knownPaths.add(path);
+        const freq = tokenize(content);
+        for (const [term, count] of tokenize(basenameText(path))) {
+            freq.set(term, (freq.get(term) ?? 0) + count);
+        }
+        this.addTerms(path, freq);
         if (mtime !== undefined) this.mtimes.set(path, mtime);
         const parsed = parseFrontmatterAndLinks(content);
         if (parsed.tags.length > 0) {
@@ -144,7 +283,103 @@ export class SearchIndex {
             this.mtimes.delete(path);
             this.tags.delete(path);
             this.clearBacklinks(path);
+            this.removeTerms(path);
         }
+    }
+
+    private addTerms(path: string, freq: Map<string, number>): void {
+        this.noteTerms.set(path, [...freq.keys()]);
+        for (const [term, count] of freq) {
+            let notes = this.postings.get(term);
+            if (!notes) this.postings.set(term, (notes = new Map()));
+            notes.set(path, count);
+        }
+    }
+
+    private removeTerms(path: string): void {
+        const terms = this.noteTerms.get(path);
+        if (!terms) return;
+        for (const term of terms) {
+            const notes = this.postings.get(term);
+            notes?.delete(path);
+            if (notes?.size === 0) this.postings.delete(term);
+        }
+        this.noteTerms.delete(path);
+    }
+
+    /**
+     * Every note containing ALL query terms, best first.
+     *
+     * Strict AND: a note missing any query word is not a match, so a
+     * multi-word query narrows instead of quietly widening to "any of these
+     * words". Each word matches by prefix of its stem (see `scoreTerm` and
+     * `stemOf`), so `meet` finds `meetings` and `meetings` finds `meeting`.
+     * Ties go to the path, so results are stable.
+     *
+     * Returns all matches, unsliced: callers filter by folder/tag/date first
+     * and apply their limit afterwards, so a filter can never hide matches
+     * that happened to rank below an unfiltered cutoff.
+     */
+    search(terms: string[]): SearchHit[] {
+        if (terms.length === 0) return [];
+        // Per query word: note -> its best score for that word. A note must
+        // appear in every one of these maps to match (AND across words, any
+        // expansion within a word).
+        const perTerm = terms.map((t) => this.scoreTerm(t));
+        if (perTerm.some((m) => m.size === 0)) return [];
+        // Intersect starting from the smallest: cheapest, and shrinks fastest.
+        const ordered = perTerm.slice().sort((a, b) => a.size - b.size);
+        const hits: SearchHit[] = [];
+        for (const [path] of ordered[0]) {
+            let score = 0;
+            let all = true;
+            for (const m of ordered) {
+                const s = m.get(path);
+                if (s === undefined) { all = false; break; }
+                score += s;
+            }
+            if (all) hits.push({ path, score });
+        }
+        return hits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+    }
+
+    /**
+     * Every note matching one query word, with that word's contribution to its
+     * score. The word expands to all indexed words starting with its stem;
+     * an exact hit weighs fully, an expansion PREFIX_WEIGHT of that, and each
+     * is (1 + log tf) * log(1 + N / df) for the indexed word that matched, so a
+     * rare expansion still counts for more than a common one. A matched word
+     * in the filename adds its IDF again. A note keeps its best expansion.
+     *
+     * The vocabulary is scanned linearly. On a personal vault that is a few
+     * thousand to a few tens of thousands of words — about a millisecond —
+     * which is cheaper to live with than a second, sorted index to maintain.
+     */
+    private scoreTerm(term: string): Map<string, number> {
+        const expansions: string[] = [];
+        if (term.length < MIN_PREFIX_LEN) {
+            if (this.postings.has(term)) expansions.push(term);
+        } else {
+            const stem = stemOf(term);
+            for (const word of this.postings.keys()) {
+                if (word.startsWith(stem)) expansions.push(word);
+            }
+        }
+        const n = this.knownPaths.size;
+        const scores = new Map<string, number>();
+        const nameTermsCache = new Map<string, Map<string, number>>();
+        for (const word of expansions) {
+            const notes = this.postings.get(word)!;
+            const idf = Math.log(1 + n / notes.size);
+            const weight = word === term ? 1 : PREFIX_WEIGHT;
+            for (const [path, tf] of notes) {
+                let nameTerms = nameTermsCache.get(path);
+                if (!nameTerms) nameTermsCache.set(path, (nameTerms = tokenize(basenameText(path))));
+                const s = weight * ((1 + Math.log(tf)) * idf + (nameTerms.has(word) ? idf : 0));
+                if (s > (scores.get(path) ?? 0)) scores.set(path, s);
+            }
+        }
+        return scores;
     }
 
     /** Remove all backlink entries where path is the source. */
@@ -223,6 +458,8 @@ export class SearchIndex {
     clear(): void {
         const paths = Array.from(this.knownPaths);
         for (const p of paths) this.remove(p);
+        this.postings.clear();
+        this.noteTerms.clear();
         this._since = "";
         this._state = "building";
     }
@@ -245,5 +482,10 @@ export class SearchIndex {
 
     get size(): number {
         return this.knownPaths.size;
+    }
+
+    /** Distinct terms in the full-text index. */
+    get termCount(): number {
+        return this.postings.size;
     }
 }

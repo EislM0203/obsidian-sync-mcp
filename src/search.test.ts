@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
-import { SearchIndex } from "./search.js";
+import { SearchIndex, queryTerms, stemOf, MAX_QUERY_TERMS } from "./search.js";
 
 let tmpDir: string;
 
@@ -181,5 +181,168 @@ describe("SearchIndex persistence", () => {
     it("returns false when no persist path configured", async () => {
         const idx = new SearchIndex();
         assert.equal(await idx.loadFromDisk(), false);
+    });
+});
+
+describe("SearchIndex full-text", () => {
+    const search = (idx: SearchIndex, q: string) => idx.search(queryTerms(q)).map((h) => h.path);
+
+    it("finds a word that occurs in only one note", () => {
+        // The branch this grew from pruned terms seen in fewer than two notes,
+        // which deleted exactly the most useful searches.
+        const idx = new SearchIndex();
+        idx.update("secret.md", "the quetzalcoatl migration plan", 1);
+        idx.update("a.md", "gardening notes", 2);
+        idx.update("b.md", "more gardening notes", 3);
+        assert.deepEqual(search(idx, "quetzalcoatl"), ["secret.md"]);
+    });
+
+    it("requires every query word (strict AND, no fallback to OR)", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "quarterly budget review", 1);
+        idx.update("b.md", "quarterly gardening", 2);
+        assert.deepEqual(search(idx, "quarterly budget"), ["a.md"]);
+        assert.deepEqual(search(idx, "quarterly nonexistent"), []);
+    });
+
+    it("ignores case, including Greek final sigma and other variant letters", () => {
+        const idx = new SearchIndex();
+        idx.update("greek.md", "Η ΟΔΟΣ είναι κλειστή", 1);
+        idx.update("micro.md", "a 5 µm gap", 2);
+        assert.deepEqual(search(idx, "οδοσ"), ["greek.md"]);
+        assert.deepEqual(search(idx, "ΟΔΟΣ"), ["greek.md"]);
+        assert.deepEqual(search(idx, "μm"), ["micro.md"]);
+    });
+
+    it("treats NFD and NFC text as the same word", () => {
+        const idx = new SearchIndex();
+        idx.update("z.md", "Reise nach Zürich", 1);
+        assert.deepEqual(search(idx, "Zürich"), ["z.md"]);
+    });
+
+    it("indexes the filename and ranks a filename hit first", () => {
+        const idx = new SearchIndex();
+        idx.update("notes/mentions.md", "we discussed the budget", 1);
+        idx.update("budget.md", "numbers for next year", 2);
+        assert.deepEqual(search(idx, "budget"), ["budget.md", "notes/mentions.md"]);
+    });
+
+    it("ranks rarer words and repeated words higher", () => {
+        const idx = new SearchIndex();
+        idx.update("once.md", "deadline mentioned", 1);
+        idx.update("often.md", "deadline deadline deadline", 2);
+        assert.deepEqual(search(idx, "deadline"), ["often.md", "once.md"]);
+    });
+
+    it("keeps link text searchable but not link URLs", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "see [the roadmap](https://example.com/zzqq) and [[Project Atlas|atlas notes]]", 1);
+        assert.deepEqual(search(idx, "roadmap"), ["a.md"]);
+        assert.deepEqual(search(idx, "atlas"), ["a.md"]);
+        assert.deepEqual(search(idx, "zzqq"), []);
+    });
+
+    it("does not index code", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "prose here\n```\nfunctionname()\n```\nand `inlinecode`", 1);
+        assert.deepEqual(search(idx, "functionname"), []);
+        assert.deepEqual(search(idx, "inlinecode"), []);
+        assert.deepEqual(search(idx, "prose"), ["a.md"]);
+    });
+
+    it("forgets old content on update and everything on remove", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "zebrafish", 1);
+        idx.update("a.md", "axolotl", 2);
+        assert.deepEqual(search(idx, "zebrafish"), []);
+        assert.deepEqual(search(idx, "axolotl"), ["a.md"]);
+        idx.remove("a.md");
+        assert.deepEqual(search(idx, "axolotl"), []);
+        assert.equal(idx.termCount, 0);
+    });
+
+    it("drops stop words from queries and caps the term count", () => {
+        assert.deepEqual(queryTerms("the budget and the plan"), ["budget", "plan"]);
+        assert.deepEqual(queryTerms("the and of"), []);
+        assert.equal(queryTerms(Array.from({ length: 100 }, (_, i) => `w${i}`).join(" ")).length, MAX_QUERY_TERMS);
+    });
+
+    it("survives a save/load round trip", async () => {
+        const path = join(tmpDir, "fulltext.json");
+        const idx1 = new SearchIndex(path, "pw");
+        idx1.update("a.md", "quarterly budget", 1);
+        await idx1.saveToDisk();
+        const idx2 = new SearchIndex(path, "pw");
+        assert.ok(await idx2.loadFromDisk());
+        assert.deepEqual(search(idx2, "budget"), ["a.md"]);
+    });
+
+    it("rebuilds when loading an index written before full-text search existed", async () => {
+        // 0.7.0 wrote notes without terms. Loading that as-is would make every
+        // search return nothing, and CouchDB catch-up would never fill it in.
+        const path = join(tmpDir, "legacy.json");
+        const { writeFile } = await import("fs/promises");
+        await writeFile(path, JSON.stringify({ mtimes: { "a.md": 1 }, tags: {}, links: {}, since: "42-abc" }));
+        const idx = new SearchIndex(path);
+        assert.equal(await idx.loadFromDisk(), false);
+        assert.equal(idx.size, 0);
+        assert.equal(idx.since, "", "since must reset so CouchDB replays from the start");
+    });
+});
+
+describe("SearchIndex prefix and inflection matching", () => {
+    const search = (idx: SearchIndex, q: string) => idx.search(queryTerms(q)).map((h) => h.path);
+
+    it("finds longer forms of a word by prefix", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "weekly meetings with the team", 1);
+        idx.update("b.md", "the deployment went fine", 2);
+        assert.deepEqual(search(idx, "meet"), ["a.md"]);
+        assert.deepEqual(search(idx, "deploy"), ["b.md"]);
+    });
+
+    it("finds the base form from a plural or past-tense query", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "one meeting today", 1);
+        idx.update("b.md", "still deploying", 2);
+        idx.update("c.md", "a box of watches", 3);
+        assert.deepEqual(search(idx, "meetings"), ["a.md"]);
+        assert.deepEqual(search(idx, "deployed"), ["b.md"]);
+        assert.deepEqual(search(idx, "watch"), ["c.md"]);
+    });
+
+    it("weighs an exact match above a prefix match, other things equal", () => {
+        // Not an absolute tier: a note that repeats "meetings" often can still
+        // outrank one mentioning "meeting" once, which is the better answer.
+        const idx = new SearchIndex();
+        idx.update("prefix.md", "meetings", 1);
+        idx.update("exact.md", "meeting", 2);
+        assert.deepEqual(search(idx, "meeting"), ["exact.md", "prefix.md"]);
+    });
+
+    it("keeps AND across words while expanding each one", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "deployment meetings", 1);
+        idx.update("b.md", "deployment only", 2);
+        assert.deepEqual(search(idx, "deploy meet"), ["a.md"]);
+    });
+
+    it("matches short words exactly instead of expanding them", () => {
+        const idx = new SearchIndex();
+        idx.update("a.md", "about aboard", 1);
+        idx.update("b.md", "ab testing", 2);
+        assert.deepEqual(search(idx, "ab"), ["b.md"]);
+    });
+
+    it("does not stem words into unrelated shorter ones", () => {
+        assert.equal(stemOf("meetings"), "meeting");
+        assert.equal(stemOf("deployed"), "deploy");
+        assert.equal(stemOf("watches"), "watch");
+        assert.equal(stemOf("notes"), "note", "not 'not', which would match 'nothing'");
+        assert.equal(stemOf("used"), "used", "not 'us'");
+        assert.equal(stemOf("class"), "class", "a double s is not a plural");
+        const idx = new SearchIndex();
+        idx.update("a.md", "nothing to see", 1);
+        assert.deepEqual(search(idx, "notes"), []);
     });
 });

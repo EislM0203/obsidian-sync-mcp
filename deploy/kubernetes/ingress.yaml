@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: obsidian-sync-mcp
+  annotations:
+    # cert-manager.io/cluster-issuer: letsencrypt
+    #
+    # MCP responses stream over SSE. Traefik handles that out of the box;
+    # ingress-nginx needs buffering off and long timeouts:
+    # nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  # ingressClassName: traefik
+  rules:
+    - host: obsidian-mcp.example.com   # must match BASE_URL in configmap.yaml
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: obsidian-sync-mcp
+                port:
+                  name: http
+  tls:
+    - hosts: [obsidian-mcp.example.com]
+      secretName: obsidian-sync-mcp-tls

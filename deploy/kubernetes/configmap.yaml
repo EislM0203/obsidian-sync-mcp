@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: obsidian-sync-mcp
+data:
+  # CouchDB mode (Self-hosted LiveSync). Point this at your CouchDB service.
+  COUCHDB_URL: "http://couchdb.couchdb.svc.cluster.local:5984"
+  COUCHDB_USER: "admin"
+  COUCHDB_DATABASE: "obsidian"
+  # Set to "true" only if "Obfuscate Properties" is enabled in LiveSync.
+  COUCHDB_OBFUSCATE_PROPERTIES: "false"
+  VAULT_NAME: "MyVault"
+  # Public URL clients reach the server on. OAuth redirects are built from
+  # it, so it must match the Ingress host exactly (scheme included).
+  BASE_URL: "https://obsidian-mcp.example.com"
+  PORT: "8787"
+  HOST: "0.0.0.0"
+  # Search index and OAuth tokens live here; backed by the PVC.
+  DATA_DIR: "/data"
+  # Optional: disable write tools, or restrict writes to folders.
+  READ_ONLY: "false"
+  # WRITE_FOLDERS: "MCP,Inbox"

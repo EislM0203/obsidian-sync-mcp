@@ -5,6 +5,8 @@ import type { VaultBackend } from "./vault-backend.js";
 import type { SearchIndex } from "./search.js";
 import { isPathWritable } from "./write-scope.js";
 import { describeListing, describeNoMatch } from "./list-format.js";
+import { extractSnippet } from "./parse.js";
+import { queryTerms, stemOf } from "./search.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -20,6 +22,12 @@ const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note"] as c
 // note to arrive in one piece, small enough to keep one read inside a sane
 // context budget. Other clients ignore the key.
 export const READ_NOTE_MAX_RESULT_SIZE_CHARS = 100_000;
+
+/** SECURITY.md caps search responses at 50 matches, so a huge result set cannot be siphoned in one call. */
+export const MAX_SEARCH_RESULTS = 50;
+
+/** Longest accepted search query. It is attacker-supplied text that is tokenized and echoed back. */
+export const MAX_QUERY_CHARS = 512;
 
 export function registerTools(
     server: FastMCP,
@@ -371,6 +379,94 @@ export function registerTools(
             }
             lines.push(`\n[Open in Obsidian](${deepLink})`);
             return lines.join("\n");
+        },
+    });
+
+    server.addTool({
+        name: "search_vault",
+        description:
+            "Full-text search across note content and filenames. Every word must appear in a note for it to match (AND); common words like 'the' or 'and' are ignored. Matching is case-insensitive and by word prefix, with simple plural and tense handling: 'deploy' finds 'deployment', and 'meetings' finds 'meeting'. Exact matches weigh more than expanded ones. Returns the best matches first, each with a snippet. Narrow with folder, tag, or modified_after. Use list_notes instead to find a note by its name.",
+        parameters: z.object({
+            query: z
+                .string()
+                .max(MAX_QUERY_CHARS)
+                .describe("Words to search for, e.g. 'quarterly budget'. All words must appear in a note."),
+            folder: z.string().optional().describe("Only search inside this folder, e.g. 'daily' or 'projects'."),
+            tag: z.string().optional().describe("Only search notes carrying this tag. Use list_tags to discover tags."),
+            modified_after: z
+                .string()
+                .optional()
+                .describe("Only search notes modified after this ISO date, e.g. '2026-03-25'."),
+            limit: z.coerce
+                .number()
+                .optional()
+                .describe(`Max number of results. Default 10, maximum ${MAX_SEARCH_RESULTS}.`),
+        }),
+        execute: async ({ query, folder, tag, modified_after, limit }) => {
+            const terms = queryTerms(query);
+            if (terms.length === 0) {
+                return query.trim()
+                    ? `Nothing to search for in "${query.trim()}": common words like 'the' and 'and' are not indexed. Add a more specific word.`
+                    : "Empty query. Pass words to search for, e.g. search_vault(query='quarterly budget').";
+            }
+            let cutoff: number | null = null;
+            if (modified_after) {
+                cutoff = new Date(modified_after).getTime();
+                if (isNaN(cutoff)) return `Invalid date format: ${modified_after}. Use ISO format like '2026-03-25'.`;
+            }
+
+            // Filter BEFORE the limit: applied after, a filter silently drops
+            // matching notes that happened to rank below the unfiltered top N.
+            const prefix = folder && !folder.endsWith("/") ? folder + "/" : folder;
+            const matches = searchIndex
+                .search(terms)
+                .filter((h) => !prefix || h.path.startsWith(prefix))
+                .filter((h) => !tag || searchIndex.getTags(h.path).includes(tag))
+                .filter((h) => cutoff === null || searchIndex.getMtime(h.path) >= cutoff);
+
+            const filters: string[] = [];
+            if (folder) filters.push(`folder="${folder}"`);
+            if (tag) filters.push(`tag="${tag}"`);
+            if (modified_after) filters.push(`modified_after="${modified_after}"`);
+            const filterClause = filters.length > 0 ? `, ${filters.join(", ")}` : "";
+            const shownQuery = query.length > 120 ? query.slice(0, 120) + "…" : query;
+            const indexNote =
+                searchIndex.state === "building"
+                    ? ` Index: catching up (${searchIndex.size} notes indexed so far); results may be incomplete.`
+                    : searchIndex.state === "failed"
+                      ? " Index: rebuild failed at startup (see server log); results may be incomplete or stale."
+                      : "";
+
+            if (matches.length === 0) {
+                return `No notes match "${shownQuery}"${filterClause}.${indexNote}`;
+            }
+            const cap = Math.min(Math.max(limit ?? 10, 1), MAX_SEARCH_RESULTS);
+            const shown = matches.slice(0, cap);
+            const header =
+                matches.length > shown.length
+                    ? `Showing ${shown.length} of ${matches.length} notes matching "${shownQuery}"${filterClause}, best first (limit=${cap}).`
+                    : `${matches.length} note${matches.length === 1 ? "" : "s"} matching "${shownQuery}"${filterClause}, best first.`;
+
+            // Only the notes being shown are read, for their snippets.
+            const lines = await Promise.all(
+                shown.map(async ({ path }) => {
+                    let content: string | null = null;
+                    try {
+                        content = await vault.readNote(path);
+                    } catch {
+                        // A note that fails to read still matched; show it without a snippet.
+                    }
+                    const mtime = searchIndex.getMtime(path);
+                    const date = mtime ? ` · ${new Date(mtime).toISOString().slice(0, 10)}` : "";
+                    const head = `- [${path}](${makeDeepLink(vaultName, path)})${date}`;
+                    if (!content) return head;
+                    // Stems, not the typed words: a note matched via "meeting" for the
+                    // query "meetings" does not contain "meetings" to anchor on.
+                    const snippet = extractSnippet(content, terms.map(stemOf).join(" ")).replace(/\s+/g, " ").trim();
+                    return snippet ? `${head}\n  ${snippet}` : head;
+                }),
+            );
+            return [header + indexNote, ...lines].join("\n");
         },
     });
 }

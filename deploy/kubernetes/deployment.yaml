@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: obsidian-sync-mcp
+  labels:
+    app.kubernetes.io/name: obsidian-sync-mcp
+spec:
+  # Exactly one replica: the search index and OAuth sessions are held in the
+  # process and persisted to a single RWO volume. Recreate (not RollingUpdate)
+  # so two pods never write the same index file during a rollout.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: obsidian-sync-mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: obsidian-sync-mcp
+    spec:
+      # Harbor's "library" project is public by default. If yours is private:
+      #   kubectl -n obsidian-sync-mcp create secret docker-registry harbor-pull \
+      #     --docker-server=harbor.cloud.traunseenet.com --docker-username=... --docker-password=...
+      # imagePullSecrets:
+      #   - name: harbor-pull
+      securityContext:
+        # The node:22-slim image ships a "node" user with uid/gid 1000.
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: obsidian-sync-mcp
+          image: harbor.cloud.traunseenet.com/library/obsidian-sync-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8787
+          envFrom:
+            - configMapRef:
+                name: obsidian-sync-mcp
+          env:
+            - name: COUCHDB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: obsidian-sync-mcp, key: COUCHDB_PASSWORD }
+            - name: MCP_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef: { name: obsidian-sync-mcp, key: MCP_AUTH_TOKEN }
+            - name: COUCHDB_PASSPHRASE
+              valueFrom:
+                secretKeyRef: { name: obsidian-sync-mcp, key: COUCHDB_PASSPHRASE, optional: true }
+            # Keep V8's heap below the container limit so Node collects
+            # garbage before the kernel OOM-kills the pod.
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=384"
+          # FastMCP serves GET /health without auth.
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: obsidian-sync-mcp-data
+        - name: tmp
+          emptyDir: {}

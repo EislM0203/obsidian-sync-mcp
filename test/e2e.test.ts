@@ -21,6 +21,8 @@ const NODE_BIN = existsSync("/opt/homebrew/opt/node@22/bin/node")
 
 let server: ChildProcess;
 let vaultDir: string;
+/** Kept out of the real ~/.obsidian-mcp: a leftover index from an earlier run would make these tests non-deterministic. */
+let dataDir: string;
 let sessionId: string;
 let serverLogs: string;
 let lastInitResult: any = null;
@@ -62,7 +64,7 @@ async function callTool(name: string, args: any = {}): Promise<string> {
 async function startServer(env: Record<string, string> = {}): Promise<void> {
     serverLogs = "";
     server = spawn(NODE_BIN, ["dist/main.js"], {
-        env: { ...process.env, PORT: String(PORT), MCP_AUTH_TOKEN: AUTH, ...env },
+        env: { ...process.env, PORT: String(PORT), MCP_AUTH_TOKEN: AUTH, DATA_DIR: dataDir, ...env },
         stdio: "pipe",
     });
     server.stdout?.on("data", (d) => { serverLogs += d.toString(); });
@@ -99,6 +101,7 @@ async function stopServer(): Promise<string> {
 
 before(async () => {
     vaultDir = await mkdtemp(join(tmpdir(), "vault-e2e-"));
+    dataDir = await mkdtemp(join(tmpdir(), "data-e2e-"));
     await mkdir(join(vaultDir, "daily"), { recursive: true });
     await mkdir(join(vaultDir, "projects"), { recursive: true });
     await writeFile(join(vaultDir, "Welcome.md"), "---\ntitle: Welcome\ntags: [intro]\n---\n# Welcome\nHello world");
@@ -111,6 +114,7 @@ before(async () => {
 after(async () => {
     await stopServer();
     if (vaultDir) await rm(vaultDir, { recursive: true, force: true });
+    if (dataDir) await rm(dataDir, { recursive: true, force: true });
 });
 
 // --- Tool Tests ---
@@ -373,6 +377,59 @@ describe("E2E: MCP_INSTRUCTIONS", () => {
     });
 });
 
+describe("E2E: search_vault", () => {
+    // Own fixtures with words nothing else touches: earlier blocks rewrite the shared notes.
+    before(async () => {
+        await callTool("write_note", { path: "searchbox/alpha.md", content: "---\ntags: [searchbox]\n---\nThe quarterly zebrafish budget is due Friday." });
+        await callTool("write_note", { path: "searchbox/beta.md", content: "Gardening notes about zebrafish habitats." });
+        await callTool("write_note", { path: "searchbox/quokka.md", content: "This body mentions nothing of interest." });
+    });
+
+    it("finds a note by body text, with a snippet and deep link", async () => {
+        const out = await callTool("search_vault", { query: "quarterly" });
+        assert.ok(out.includes("searchbox/alpha.md"), out);
+        assert.ok(out.includes("quarterly zebrafish budget"), out);
+        assert.ok(out.includes("obsidian://open"));
+        assert.ok(!out.includes("searchbox/beta.md"));
+    });
+
+    it("ANDs words and finds a word unique to one note", async () => {
+        const out = await callTool("search_vault", { query: "zebrafish gardening" });
+        assert.ok(out.includes("searchbox/beta.md") && !out.includes("searchbox/alpha.md"), out);
+    });
+
+    it("matches word prefixes and simple inflections", async () => {
+        assert.ok((await callTool("search_vault", { query: "zebra" })).includes("searchbox/alpha.md"));
+        assert.ok((await callTool("search_vault", { query: "habitat" })).includes("searchbox/beta.md"));
+    });
+
+    it("finds a note by filename", async () => {
+        assert.ok((await callTool("search_vault", { query: "quokka" })).includes("searchbox/quokka.md"));
+    });
+
+    it("filters by tag before limiting", async () => {
+        const out = await callTool("search_vault", { query: "zebrafish", tag: "searchbox", limit: 1 });
+        assert.ok(out.includes("searchbox/alpha.md"), out);
+    });
+
+    it("reflects edits, deletes and moves immediately", async () => {
+        await callTool("write_note", { path: "searchbox/beta.md", content: "Now about axolotls only." });
+        assert.ok((await callTool("search_vault", { query: "axolotls" })).includes("searchbox/beta.md"));
+        assert.ok(!(await callTool("search_vault", { query: "gardening" })).includes("searchbox/beta.md"));
+        await callTool("move_note", { from: "searchbox/beta.md", to: "searchbox/gamma.md" });
+        const moved = await callTool("search_vault", { query: "axolotls" });
+        assert.ok(moved.includes("searchbox/gamma.md") && !moved.includes("searchbox/beta.md"), moved);
+        await callTool("delete_note", { path: "searchbox/gamma.md" });
+        assert.ok((await callTool("search_vault", { query: "axolotls" })).includes("No notes match"));
+    });
+
+    it("rejects an over-long query", async () => {
+        const resp = await mcpCall("tools/call", { name: "search_vault", arguments: { query: "x".repeat(600) } });
+        const text = resp?.result?.content?.[0]?.text ?? "";
+        assert.ok(resp?.error || resp?.result?.isError || /512|too_big|at most/i.test(text), JSON.stringify(resp).slice(0, 300));
+    });
+});
+
 describe("E2E: cold restart with persisted index", () => {
     it("picks up changes and removes stale entries after restart", async () => {
         // Stop server (triggers saveToDisk)
@@ -411,6 +468,10 @@ describe("E2E: cold restart with persisted index", () => {
 
         // Deleted note should be gone
         assert.ok(!list.includes("projects/test.md"), "Deleted note should not appear");
+
+        // Full-text search works after a restart, including content written while down.
+        assert.ok((await callTool("search_vault", { query: "freshcontent" })).includes("new-while-down.md"));
+        assert.ok((await callTool("search_vault", { query: "uniqueword" })).includes("daily/2026-03-24.md"));
     });
 });
 
